@@ -5,10 +5,11 @@
 #include <string>
 #include <algorithm>
 #include <filesystem>
+#include <memory>
 #include <thread>
 #include <mutex>
-#include <queue>
-#include <memory>
+#include <atomic>
+#include <chrono>
 
 namespace fs = std::filesystem;
 
@@ -16,10 +17,10 @@ struct ImageData {
     SDL_Texture* texture;
     SDL_Surface* surface;
     std::string filename;
-    bool loaded;
-    bool surfaceLoaded;
+    std::atomic<bool> surfaceLoaded;
+    std::atomic<bool> textureCreated;
     
-    ImageData() : texture(nullptr), surface(nullptr), loaded(false), surfaceLoaded(false) {}
+    ImageData() : texture(nullptr), surface(nullptr), surfaceLoaded(false), textureCreated(false) {}
     ~ImageData() {
         if (texture) {
             SDL_DestroyTexture(texture);
@@ -38,16 +39,20 @@ private:
     std::vector<std::unique_ptr<ImageData>> images;
     int currentIndex;
     int windowWidth, windowHeight;
-    std::thread prefetchThread;
-    std::mutex imageMutex;
-    std::queue<int> prefetchQueue;
     bool running;
     
-    const int PREFETCH_COUNT = 20; // Number of images to prefetch ahead/behind
+    // Background loading
+    std::vector<std::thread> backgroundLoaders;
+    std::mutex imagesMutex;
+    std::atomic<bool> backgroundLoadingComplete;
+    std::atomic<size_t> nextImageToLoad;
+    const int INITIAL_LOAD_COUNT = 10;
+    const int NUM_LOADING_THREADS = 4;
     
 public:
     FisheyeViewer() : window(nullptr), renderer(nullptr), currentIndex(0), 
-                      windowWidth(1280), windowHeight(720), running(true) {}
+                      windowWidth(1280), windowHeight(720), running(true), 
+                      backgroundLoadingComplete(false), nextImageToLoad(0) {}
     
     ~FisheyeViewer() {
         cleanup();
@@ -118,81 +123,130 @@ public:
             images[i]->filename = imageFiles[i];
         }
         
-        std::cout << "Loaded " << imageFiles.size() << " image files" << std::endl;
+        std::cout << "Found " << imageFiles.size() << " image files" << std::endl;
         
-        // Load the first image surface immediately
-        loadImageSurface(0);
-        
-        // Start prefetching thread
-        prefetchThread = std::thread(&FisheyeViewer::prefetchImages, this);
+        // Load initial images for instant access, then start background loading
+        loadInitialImages();
+        startBackgroundLoading();
         
         return true;
     }
     
-    
-    SDL_Texture* createTextureFromSurface(SDL_Surface* surface) {
-        if (!surface) return nullptr;
+    SDL_Texture* loadImageTexture(const std::string& filename) {
+        SDL_Surface* surface = IMG_Load(filename.c_str());
+        if (!surface) {
+            std::cerr << "Unable to load image " << filename << "! SDL_image Error: " << IMG_GetError() << std::endl;
+            return nullptr;
+        }
         
         SDL_Texture* texture = SDL_CreateTextureFromSurface(renderer, surface);
+        SDL_FreeSurface(surface);
+        
         if (!texture) {
-            std::cerr << "Unable to create texture! SDL Error: " << SDL_GetError() << std::endl;
+            std::cerr << "Unable to create texture from " << filename << "! SDL Error: " << SDL_GetError() << std::endl;
         }
+        
         return texture;
     }
     
-    void loadImageSurface(int index) {
-        if (index < 0 || index >= static_cast<int>(images.size())) return;
+    void loadInitialImages() {
+        size_t imageCount = images.size();
+        size_t initialCount = std::min((size_t)INITIAL_LOAD_COUNT, imageCount);
         
-        std::lock_guard<std::mutex> lock(imageMutex);
+        std::cout << "Loading first " << initialCount << " images for instant access..." << std::endl;
         
-        if (!images[index]->surfaceLoaded) {
-            images[index]->surface = IMG_Load(images[index]->filename.c_str());
-            if (images[index]->surface) {
-                images[index]->surfaceLoaded = true;
-            } else {
-                std::cerr << "Unable to load image " << images[index]->filename << "! SDL_image Error: " << IMG_GetError() << std::endl;
-            }
-        }
-    }
-    
-    void ensureTextureLoaded(int index) {
-        if (index < 0 || index >= static_cast<int>(images.size())) return;
-        
-        std::lock_guard<std::mutex> lock(imageMutex);
-        
-        if (!images[index]->loaded && images[index]->surfaceLoaded && images[index]->surface) {
-            images[index]->texture = createTextureFromSurface(images[index]->surface);
-            if (images[index]->texture) {
-                images[index]->loaded = true;
-                // Free surface after creating texture
-                SDL_FreeSurface(images[index]->surface);
-                images[index]->surface = nullptr;
-            }
-        }
-    }
-    
-    void prefetchImages() {
-        while (running) {
-            std::vector<int> indicesToLoad;
+        for (size_t i = 0; i < initialCount; ++i) {
+            std::cout << "Loading image " << (i + 1) << "/" << initialCount << ": " 
+                      << fs::path(images[i]->filename).filename().string() << std::endl;
             
-            // Determine which surfaces to prefetch around current index
-            {
-                std::lock_guard<std::mutex> lock(imageMutex);
-                for (int offset = -PREFETCH_COUNT; offset <= PREFETCH_COUNT; ++offset) {
-                    int index = currentIndex + offset;
-                    if (index >= 0 && index < static_cast<int>(images.size()) && !images[index]->surfaceLoaded) {
-                        indicesToLoad.push_back(index);
-                    }
+            // Load surface first
+            SDL_Surface* surface = IMG_Load(images[i]->filename.c_str());
+            if (surface) {
+                std::lock_guard<std::mutex> lock(imagesMutex);
+                images[i]->surface = surface;
+                images[i]->surfaceLoaded = true;
+                
+                // Create texture immediately for initial images
+                images[i]->texture = SDL_CreateTextureFromSurface(renderer, surface);
+                if (images[i]->texture) {
+                    images[i]->textureCreated = true;
                 }
             }
+        }
+        
+        // Set the next image index for background loading
+        nextImageToLoad = initialCount;
+        
+        std::cout << "Initial " << initialCount << " images loaded! Starting background loading..." << std::endl;
+    }
+    
+    void loadSurfaceInBackground(size_t index) {
+        if (index >= images.size()) return;
+        
+        // Load surface (this is thread-safe)
+        SDL_Surface* surface = IMG_Load(images[index]->filename.c_str());
+        
+        if (surface) {
+            std::lock_guard<std::mutex> lock(imagesMutex);
+            images[index]->surface = surface;
+            images[index]->surfaceLoaded = true;
+        }
+    }
+    
+    void ensureTextureCreated(size_t index) {
+        if (index >= images.size()) return;
+        
+        std::lock_guard<std::mutex> lock(imagesMutex);
+        
+        // If surface is loaded but texture not created, create it now
+        if (images[index]->surfaceLoaded && !images[index]->textureCreated && images[index]->surface) {
+            images[index]->texture = SDL_CreateTextureFromSurface(renderer, images[index]->surface);
+            if (images[index]->texture) {
+                images[index]->textureCreated = true;
+                // Keep the surface for potential future use, or free it to save memory
+                // SDL_FreeSurface(images[index]->surface);
+                // images[index]->surface = nullptr;
+            }
+        }
+    }
+    
+    void backgroundLoadingFunction() {
+        size_t imageCount = images.size();
+        
+        while (running) {
+            size_t currentIndex = nextImageToLoad.fetch_add(1);
             
-            // Load surfaces (safe to do from background thread)
-            for (int index : indicesToLoad) {
-                if (!running) break;
-                loadImageSurface(index);
+            if (currentIndex >= imageCount) {
+                break; // All images processed
             }
             
-            SDL_Delay(100); // Small delay to prevent busy waiting
+            if (currentIndex % 50 == 0 && currentIndex >= static_cast<size_t>(INITIAL_LOAD_COUNT)) {
+                std::cout << "Background loading: " << currentIndex << "/" << imageCount << " surfaces loaded" << std::endl;
+            }
+            
+            loadSurfaceInBackground(currentIndex);
+            
+            // Small delay to not overwhelm the system
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        
+        // Check if this was the last thread to finish
+        static std::atomic<int> threadsCompleted{0};
+        int completed = threadsCompleted.fetch_add(1) + 1;
+        if (completed == NUM_LOADING_THREADS) {
+            backgroundLoadingComplete = true;
+            std::cout << "Background surface loading complete! All " << imageCount << " surfaces loaded." << std::endl;
+        }
+    }
+    
+    void startBackgroundLoading() {
+        if (images.size() > static_cast<size_t>(INITIAL_LOAD_COUNT)) {
+            // Start multiple background threads for faster loading
+            for (int i = 0; i < NUM_LOADING_THREADS; ++i) {
+                backgroundLoaders.emplace_back(&FisheyeViewer::backgroundLoadingFunction, this);
+            }
+        } else {
+            backgroundLoadingComplete = true;
         }
     }
     
@@ -201,12 +255,12 @@ public:
         SDL_RenderClear(renderer);
         
         if (currentIndex >= 0 && currentIndex < static_cast<int>(images.size())) {
-            // Ensure current image texture is created (must be done on main thread)
-            ensureTextureLoaded(currentIndex);
+            // Try to create texture from surface if available (main thread only)
+            ensureTextureCreated(currentIndex);
             
-            std::lock_guard<std::mutex> lock(imageMutex);
+            std::lock_guard<std::mutex> lock(imagesMutex);
             
-            if (images[currentIndex]->loaded && images[currentIndex]->texture) {
+            if (images[currentIndex]->textureCreated && images[currentIndex]->texture) {
                 // Get texture dimensions
                 int textureWidth, textureHeight;
                 SDL_QueryTexture(images[currentIndex]->texture, nullptr, nullptr, &textureWidth, &textureHeight);
@@ -227,10 +281,32 @@ public:
                 };
                 
                 SDL_RenderCopy(renderer, images[currentIndex]->texture, nullptr, &destRect);
+            } else {
+                // Display loading message for unloaded images
+                renderLoadingMessage();
             }
         }
         
         SDL_RenderPresent(renderer);
+    }
+    
+    void renderLoadingMessage() {
+        // Simple loading indicator - draw a white rectangle in the center
+        SDL_SetRenderDrawColor(renderer, 255, 255, 255, 255);
+        SDL_Rect loadingRect = {
+            windowWidth / 2 - 100,
+            windowHeight / 2 - 25,
+            200,
+            50
+        };
+        SDL_RenderFillRect(renderer, &loadingRect);
+        
+        // Draw border
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_RenderDrawRect(renderer, &loadingRect);
+        
+        // Note: For simplicity, we're just showing a white rectangle
+        // In a full implementation, you'd use SDL_ttf for actual text
     }
     
     void handleEvent(SDL_Event& e) {
@@ -259,14 +335,12 @@ public:
     void nextImage() {
         if (currentIndex < static_cast<int>(images.size()) - 1) {
             currentIndex++;
-            loadImageSurface(currentIndex); // Load surface from any thread
         }
     }
     
     void previousImage() {
         if (currentIndex > 0) {
             currentIndex--;
-            loadImageSurface(currentIndex); // Load surface from any thread
         }
     }
     
@@ -286,9 +360,13 @@ public:
     void cleanup() {
         running = false;
         
-        if (prefetchThread.joinable()) {
-            prefetchThread.join();
+        // Wait for all background loading threads to finish
+        for (auto& loader : backgroundLoaders) {
+            if (loader.joinable()) {
+                loader.join();
+            }
         }
+        backgroundLoaders.clear();
         
         images.clear();
         
