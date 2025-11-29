@@ -2,6 +2,9 @@
 
 A high-performance C++ application using SDL2 to visualize fisheye camera images with smooth navigation and intelligent prefetching.
 
+<img width="1614" height="854" alt="image" src="https://github.com/user-attachments/assets/047aba9c-ae4c-43a2-bfda-a50305e763d3" />
+
+
 ## Features
 
 - **Fast Image Navigation**: Use left/right arrow keys to flip through images
