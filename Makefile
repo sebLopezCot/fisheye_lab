@@ -2,7 +2,9 @@ CXX = g++
 CXXFLAGS = -std=c++17 -Wall -Wextra -O3
 LIBS = -lSDL2 -lSDL2_image
 TARGET = fisheye_viewer
+DUAL_TARGET = dual_fisheye_viewer
 SOURCE = main.cpp
+DUAL_SOURCE = dual_main.cpp
 
 # Check if we're on Ubuntu/Debian and need additional include paths
 UNAME_S := $(shell uname -s)
@@ -14,13 +16,16 @@ ifeq ($(UNAME_S),Linux)
     LIBS = $(SDL2_LIBS)
 endif
 
-all: $(TARGET)
+all: $(TARGET) $(DUAL_TARGET)
 
 $(TARGET): $(SOURCE)
 	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SOURCE) $(LIBS)
 
+$(DUAL_TARGET): $(DUAL_SOURCE)
+	$(CXX) $(CXXFLAGS) -o $(DUAL_TARGET) $(DUAL_SOURCE) $(LIBS)
+
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(DUAL_TARGET)
 
 install-deps:
 	@echo "Installing SDL2 dependencies..."
@@ -44,4 +49,8 @@ run: $(TARGET)
 	@echo "Usage: ./$(TARGET) <image_directory>"
 	@echo "Example: ./$(TARGET) /path/to/your/fisheye/images"
 
-.PHONY: all clean install-deps run
+run-dual: $(DUAL_TARGET)
+	@echo "Usage: ./$(DUAL_TARGET) <left_directory> <right_directory>"
+	@echo "Example: ./$(DUAL_TARGET) /path/to/left/images /path/to/right/images"
+
+.PHONY: all clean install-deps run run-dual
