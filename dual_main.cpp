@@ -68,6 +68,7 @@ private:
     cv::Mat leftCameraMatrix, leftDistCoeffs;
     cv::Mat rightCameraMatrix, rightDistCoeffs;
     cv::Mat leftMapX, leftMapY, rightMapX, rightMapY;
+    cv::Size outputImageSize;  // Size for the unwrapped output images
     bool calibrationLoaded;
     
     // Background loading
@@ -80,7 +81,7 @@ private:
     
 public:
     StereoFisheyeViewer() : window(nullptr), renderer(nullptr), currentIndex(0), 
-                            windowWidth(1600), windowHeight(800), running(true), 
+                            windowWidth(2400), windowHeight(1200), running(true), 
                             calibrationLoaded(false), backgroundLoadingComplete(false), 
                             nextImageToLoad(0) {}
     
@@ -99,7 +100,7 @@ public:
             return false;
         }
         
-        window = SDL_CreateWindow("Dual Fisheye Camera Viewer - Stereo",
+        window = SDL_CreateWindow("Dual Fisheye Unwrapped Viewer - Left & Right Cameras",
                                   SDL_WINDOWPOS_CENTERED,
                                   SDL_WINDOWPOS_CENTERED,
                                   windowWidth, windowHeight,
@@ -123,27 +124,39 @@ public:
     
     bool loadCalibration() {
         try {
-            std::cout << "Loading fisheye calibration parameters..." << std::endl;
+            std::cout << "=== LOADING DUAL FISHEYE CALIBRATION PARAMETERS ===" << std::endl;
             
             // Load fisheye parameters for left (image_02) and right (image_03) cameras
             leftCameraParams = kitti360::loadFisheyeParams("kitti360_calibration/image_02.yaml");
             rightCameraParams = kitti360::loadFisheyeParams("kitti360_calibration/image_03.yaml");
             
+            std::cout << "✓ Successfully loaded calibration files" << std::endl;
             std::cout << "Left camera (image_02): " << leftCameraParams.camera_name << std::endl;
+            std::cout << "  Image size: " << leftCameraParams.image_width << "x" << leftCameraParams.image_height << std::endl;
+            std::cout << "  Xi: " << leftCameraParams.xi << std::endl;
+            std::cout << "  Distortion: k1=" << leftCameraParams.distortion[0] << ", k2=" << leftCameraParams.distortion[1] 
+                      << ", p1=" << leftCameraParams.distortion[2] << ", p2=" << leftCameraParams.distortion[3] << std::endl;
+            
             std::cout << "Right camera (image_03): " << rightCameraParams.camera_name << std::endl;
+            std::cout << "  Image size: " << rightCameraParams.image_width << "x" << rightCameraParams.image_height << std::endl;
+            std::cout << "  Xi: " << rightCameraParams.xi << std::endl;
+            std::cout << "  Distortion: k1=" << rightCameraParams.distortion[0] << ", k2=" << rightCameraParams.distortion[1] 
+                      << ", p1=" << rightCameraParams.distortion[2] << ", p2=" << rightCameraParams.distortion[3] << std::endl;
             
             // Convert fisheye parameters to OpenCV format
             setupCameraMatrices();
             
-            // Create undistortion maps
+            // Create undistortion maps with wider output format
             createUndistortionMaps();
             
             calibrationLoaded = true;
-            std::cout << "Calibration loaded successfully!" << std::endl;
+            std::cout << "✓ Dual camera calibration loaded and undistortion maps created successfully!" << std::endl;
+            std::cout << "==================================================================" << std::endl;
             return true;
             
         } catch (const std::exception& e) {
-            std::cerr << "Failed to load calibration: " << e.what() << std::endl;
+            std::cerr << "✗ CRITICAL ERROR: Failed to load dual calibration: " << e.what() << std::endl;
+            std::cerr << "✗ Make sure both kitti360_calibration/image_02.yaml and image_03.yaml exist" << std::endl;
             calibrationLoaded = false;
             return false;
         }
@@ -164,51 +177,98 @@ public:
         rightCameraMatrix.at<double>(0, 2) = rightCameraParams.projection[2]; // u0 (cx)
         rightCameraMatrix.at<double>(1, 2) = rightCameraParams.projection[3]; // v0 (cy)
         
-        // For fisheye model, we need exactly 4 coefficients: k1, k2, k3, k4
-        // KITTI360 MEI provides k1, k2, p1, p2 - we'll use k1, k2 and set k3, k4 to 0
+        std::cout << "Left camera matrix:" << std::endl << leftCameraMatrix << std::endl;
+        std::cout << "Right camera matrix:" << std::endl << rightCameraMatrix << std::endl;
+        
+        // For fisheye model, use ALL 4 distortion parameters from calibration
+        // Map MEI model parameters to OpenCV fisheye model: k1, k2, p1->k3, p2->k4
         leftDistCoeffs = cv::Mat::zeros(4, 1, CV_64F);
         leftDistCoeffs.at<double>(0) = leftCameraParams.distortion[0]; // k1
         leftDistCoeffs.at<double>(1) = leftCameraParams.distortion[1]; // k2
-        leftDistCoeffs.at<double>(2) = 0.0; // k3
-        leftDistCoeffs.at<double>(3) = 0.0; // k4
+        leftDistCoeffs.at<double>(2) = leftCameraParams.distortion[2]; // k3 (was p1)
+        leftDistCoeffs.at<double>(3) = leftCameraParams.distortion[3]; // k4 (was p2)
         
         rightDistCoeffs = cv::Mat::zeros(4, 1, CV_64F);
         rightDistCoeffs.at<double>(0) = rightCameraParams.distortion[0]; // k1
         rightDistCoeffs.at<double>(1) = rightCameraParams.distortion[1]; // k2
-        rightDistCoeffs.at<double>(2) = 0.0; // k3
-        rightDistCoeffs.at<double>(3) = 0.0; // k4
+        rightDistCoeffs.at<double>(2) = rightCameraParams.distortion[2]; // k3 (was p1)
+        rightDistCoeffs.at<double>(3) = rightCameraParams.distortion[3]; // k4 (was p2)
+        
+        std::cout << "Left distortion coefficients (k1, k2, k3, k4): " << leftDistCoeffs.t() << std::endl;
+        std::cout << "Right distortion coefficients (k1, k2, k3, k4): " << rightDistCoeffs.t() << std::endl;
+        std::cout << "Note: Using ALL calibration parameters (no zeros)" << std::endl;
     }
     
     void createUndistortionMaps() {
-        cv::Size imageSize(leftCameraParams.image_width, leftCameraParams.image_height);
+        cv::Size inputImageSize(leftCameraParams.image_width, leftCameraParams.image_height);
         
-        std::cout << "Creating fisheye undistortion maps for image size: " << imageSize << std::endl;
+        // Create a much larger output size for the unwrapped fisheye
+        // Fisheye ~180° FOV needs to be spread across a wider format
+        outputImageSize.width = static_cast<int>(inputImageSize.width * 2.5);
+        outputImageSize.height = static_cast<int>(inputImageSize.height * 1.5);
         
-        // Create new camera matrices with scaled focal lengths for wider FOV
+        std::cout << "Creating dual fisheye undistortion maps:" << std::endl;
+        std::cout << "  Input image size: " << inputImageSize << std::endl;
+        std::cout << "  Output image size: " << outputImageSize << " (wider for unwrapped view)" << std::endl;
+        
+        // Create new camera matrices for larger output and fisheye expansion
         cv::Mat newLeftCameraMatrix = leftCameraMatrix.clone();
         cv::Mat newRightCameraMatrix = rightCameraMatrix.clone();
-        double scale = 0.2; // More aggressive scaling to capture more of the fisheye FOV
         
-        newLeftCameraMatrix.at<double>(0, 0) *= scale; // fx
-        newLeftCameraMatrix.at<double>(1, 1) *= scale; // fy
-        newRightCameraMatrix.at<double>(0, 0) *= scale; // fx
-        newRightCameraMatrix.at<double>(1, 1) *= scale; // fy
+        // Adjust principal points to center of new larger image
+        newLeftCameraMatrix.at<double>(0, 2) = outputImageSize.width / 2.0;  // cx
+        newLeftCameraMatrix.at<double>(1, 2) = outputImageSize.height / 2.0; // cy
+        newRightCameraMatrix.at<double>(0, 2) = outputImageSize.width / 2.0;  // cx
+        newRightCameraMatrix.at<double>(1, 2) = outputImageSize.height / 2.0; // cy
+        
+        // Increase focal lengths for fisheye expansion
+        double expandScale = 2.5;
+        newLeftCameraMatrix.at<double>(0, 0) *= expandScale; // fx
+        newLeftCameraMatrix.at<double>(1, 1) *= expandScale; // fy
+        newRightCameraMatrix.at<double>(0, 0) *= expandScale; // fx
+        newRightCameraMatrix.at<double>(1, 1) *= expandScale; // fy
+        
+        std::cout << "Camera matrix scaling factor: " << expandScale << std::endl;
+        std::cout << "New left camera matrix:" << std::endl << newLeftCameraMatrix << std::endl;
+        std::cout << "New right camera matrix:" << std::endl << newRightCameraMatrix << std::endl;
         
         // Create undistortion maps for left camera using fisheye model
-        cv::fisheye::initUndistortRectifyMap(
-            leftCameraMatrix, leftDistCoeffs, cv::Mat(),
-            newLeftCameraMatrix, imageSize, CV_16SC2,
-            leftMapX, leftMapY
-        );
+        try {
+            cv::fisheye::initUndistortRectifyMap(
+                leftCameraMatrix, leftDistCoeffs, cv::Mat(),
+                newLeftCameraMatrix, outputImageSize, CV_16SC2,
+                leftMapX, leftMapY
+            );
+            std::cout << "✓ Left camera undistortion maps created successfully!" << std::endl;
+        } catch (const cv::Exception& e) {
+            std::cerr << "Left camera undistortion failed: " << e.what() << std::endl;
+            std::cerr << "Falling back to standard undistortion for left camera..." << std::endl;
+            cv::initUndistortRectifyMap(
+                leftCameraMatrix, leftDistCoeffs, cv::Mat(),
+                newLeftCameraMatrix, outputImageSize, CV_16SC2,
+                leftMapX, leftMapY
+            );
+        }
         
         // Create undistortion maps for right camera using fisheye model
-        cv::fisheye::initUndistortRectifyMap(
-            rightCameraMatrix, rightDistCoeffs, cv::Mat(),
-            newRightCameraMatrix, imageSize, CV_16SC2,
-            rightMapX, rightMapY
-        );
+        try {
+            cv::fisheye::initUndistortRectifyMap(
+                rightCameraMatrix, rightDistCoeffs, cv::Mat(),
+                newRightCameraMatrix, outputImageSize, CV_16SC2,
+                rightMapX, rightMapY
+            );
+            std::cout << "✓ Right camera undistortion maps created successfully!" << std::endl;
+        } catch (const cv::Exception& e) {
+            std::cerr << "Right camera undistortion failed: " << e.what() << std::endl;
+            std::cerr << "Falling back to standard undistortion for right camera..." << std::endl;
+            cv::initUndistortRectifyMap(
+                rightCameraMatrix, rightDistCoeffs, cv::Mat(),
+                newRightCameraMatrix, outputImageSize, CV_16SC2,
+                rightMapX, rightMapY
+            );
+        }
         
-        std::cout << "Fisheye undistortion maps created successfully!" << std::endl;
+        std::cout << "✓ Dual fisheye undistortion maps created successfully!" << std::endl;
     }
     
     SDL_Surface* undistortImage(SDL_Surface* originalSurface, bool isLeftCamera) {
@@ -222,12 +282,14 @@ public:
             return nullptr;
         }
         
-        // Apply undistortion
-        cv::Mat undistortedMat;
+        // Create output image with the larger size for unwrapped fisheye
+        cv::Mat undistortedMat(outputImageSize, originalMat.type(), cv::Scalar(0, 0, 0));
+        
+        // Apply undistortion to larger output format
         if (isLeftCamera) {
-            cv::remap(originalMat, undistortedMat, leftMapX, leftMapY, cv::INTER_LINEAR);
+            cv::remap(originalMat, undistortedMat, leftMapX, leftMapY, cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
         } else {
-            cv::remap(originalMat, undistortedMat, rightMapX, rightMapY, cv::INTER_LINEAR);
+            cv::remap(originalMat, undistortedMat, rightMapX, rightMapY, cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
         }
         
         // Convert back to SDL surface
@@ -767,7 +829,8 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    std::cout << "Use left/right arrow keys to navigate stereo pairs, ESC to quit" << std::endl;
+    std::cout << "Use left/right arrow keys to navigate unwrapped stereo pairs, ESC to quit" << std::endl;
+    std::cout << "Left half: image_02 (unwrapped), Right half: image_03 (unwrapped)" << std::endl;
     viewer.run();
     
     return 0;
