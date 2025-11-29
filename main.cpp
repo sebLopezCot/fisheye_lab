@@ -116,6 +116,26 @@ public:
         // Sort files in ascending order
         std::sort(imageFiles.begin(), imageFiles.end());
         
+        // Check if we have too many images and ask user
+        if (imageFiles.size() > 2000) {
+            std::cout << "\nFound " << imageFiles.size() << " images. This is a large dataset." << std::endl;
+            std::cout << "Loading all images may use significant memory and time." << std::endl;
+            std::cout << "Do you want to:" << std::endl;
+            std::cout << "  1. Load all " << imageFiles.size() << " images" << std::endl;
+            std::cout << "  2. Load only the first 2000 images" << std::endl;
+            std::cout << "Enter your choice (1 or 2): ";
+            
+            std::string choice;
+            std::getline(std::cin, choice);
+            
+            if (choice == "2") {
+                imageFiles.resize(2000);
+                std::cout << "Limiting to first 2000 images." << std::endl;
+            } else {
+                std::cout << "Loading all " << imageFiles.size() << " images." << std::endl;
+            }
+        }
+        
         // Initialize image data structures
         images.resize(imageFiles.size());
         for (size_t i = 0; i < images.size(); ++i) {
