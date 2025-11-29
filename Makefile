@@ -16,7 +16,7 @@ ifeq ($(UNAME_S),Linux)
     LIBS = $(SDL2_LIBS)
 endif
 
-all: $(TARGET) $(DUAL_TARGET)
+all: $(TARGET) $(DUAL_TARGET) calibration
 
 $(TARGET): $(SOURCE)
 	$(CXX) $(CXXFLAGS) -o $(TARGET) $(SOURCE) $(LIBS)
@@ -24,7 +24,40 @@ $(TARGET): $(SOURCE)
 $(DUAL_TARGET): $(DUAL_SOURCE)
 	$(CXX) $(CXXFLAGS) -o $(DUAL_TARGET) $(DUAL_SOURCE) $(LIBS)
 
-clean:
+# Calibration library targets
+calibration:
+	@echo "Building calibration library..."
+	@mkdir -p kitti360_calibration/build
+	@cd kitti360_calibration/build && cmake .. && make
+
+calibration-clean:
+	@echo "Cleaning calibration build..."
+	@rm -rf kitti360_calibration/build
+	@rm -f kitti360_calibration/test_calibration
+
+calibration-test: calibration
+	@echo "Running calibration tests..."
+	@cd kitti360_calibration && ./test_calibration
+
+calibration-install-deps:
+	@echo "Installing OpenCV dependencies for calibration..."
+	@if command -v apt-get >/dev/null 2>&1; then \
+		echo "Using apt-get (Ubuntu/Debian)"; \
+		sudo apt-get update && sudo apt-get install -y libopencv-dev; \
+	elif command -v yum >/dev/null 2>&1; then \
+		echo "Using yum (RHEL/CentOS)"; \
+		sudo yum install -y opencv-devel; \
+	elif command -v dnf >/dev/null 2>&1; then \
+		echo "Using dnf (Fedora)"; \
+		sudo dnf install -y opencv-devel; \
+	elif command -v pacman >/dev/null 2>&1; then \
+		echo "Using pacman (Arch Linux)"; \
+		sudo pacman -S opencv; \
+	else \
+		echo "Package manager not recognized. Please install OpenCV development libraries manually."; \
+	fi
+
+clean: calibration-clean
 	rm -f $(TARGET) $(DUAL_TARGET)
 
 install-deps:
@@ -53,4 +86,4 @@ run-dual: $(DUAL_TARGET)
 	@echo "Usage: ./$(DUAL_TARGET) <left_directory> <right_directory>"
 	@echo "Example: ./$(DUAL_TARGET) /path/to/left/images /path/to/right/images"
 
-.PHONY: all clean install-deps run run-dual
+.PHONY: all clean install-deps run run-dual calibration calibration-clean calibration-test calibration-install-deps
