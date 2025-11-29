@@ -1,5 +1,7 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_image.h>
+#include <opencv2/opencv.hpp>
+#include "kitti360_calibration/load_calibration.h"
 #include <iostream>
 #include <vector>
 #include <string>
@@ -60,6 +62,14 @@ private:
     int windowWidth, windowHeight;
     bool running;
     
+    // Calibration and undistortion
+    kitti360::FisheyeParams leftCameraParams;  // image_02
+    kitti360::FisheyeParams rightCameraParams; // image_03
+    cv::Mat leftCameraMatrix, leftDistCoeffs;
+    cv::Mat rightCameraMatrix, rightDistCoeffs;
+    cv::Mat leftMapX, leftMapY, rightMapX, rightMapY;
+    bool calibrationLoaded;
+    
     // Background loading
     std::vector<std::thread> backgroundLoaders;
     std::mutex imagesMutex;
@@ -71,7 +81,8 @@ private:
 public:
     StereoFisheyeViewer() : window(nullptr), renderer(nullptr), currentIndex(0), 
                             windowWidth(1600), windowHeight(800), running(true), 
-                            backgroundLoadingComplete(false), nextImageToLoad(0) {}
+                            calibrationLoaded(false), backgroundLoadingComplete(false), 
+                            nextImageToLoad(0) {}
     
     ~StereoFisheyeViewer() {
         cleanup();
@@ -108,6 +119,168 @@ public:
         SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
         
         return true;
+    }
+    
+    bool loadCalibration() {
+        try {
+            std::cout << "Loading fisheye calibration parameters..." << std::endl;
+            
+            // Load fisheye parameters for left (image_02) and right (image_03) cameras
+            leftCameraParams = kitti360::loadFisheyeParams("kitti360_calibration/image_02.yaml");
+            rightCameraParams = kitti360::loadFisheyeParams("kitti360_calibration/image_03.yaml");
+            
+            std::cout << "Left camera (image_02): " << leftCameraParams.camera_name << std::endl;
+            std::cout << "Right camera (image_03): " << rightCameraParams.camera_name << std::endl;
+            
+            // Convert fisheye parameters to OpenCV format
+            setupCameraMatrices();
+            
+            // Create undistortion maps
+            createUndistortionMaps();
+            
+            calibrationLoaded = true;
+            std::cout << "Calibration loaded successfully!" << std::endl;
+            return true;
+            
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to load calibration: " << e.what() << std::endl;
+            calibrationLoaded = false;
+            return false;
+        }
+    }
+    
+    void setupCameraMatrices() {
+        // Setup left camera matrix from fisheye parameters
+        leftCameraMatrix = cv::Mat::eye(3, 3, CV_64F);
+        leftCameraMatrix.at<double>(0, 0) = leftCameraParams.projection[0]; // gamma1 (fx)
+        leftCameraMatrix.at<double>(1, 1) = leftCameraParams.projection[1]; // gamma2 (fy)
+        leftCameraMatrix.at<double>(0, 2) = leftCameraParams.projection[2]; // u0 (cx)
+        leftCameraMatrix.at<double>(1, 2) = leftCameraParams.projection[3]; // v0 (cy)
+        
+        // Setup right camera matrix from fisheye parameters
+        rightCameraMatrix = cv::Mat::eye(3, 3, CV_64F);
+        rightCameraMatrix.at<double>(0, 0) = rightCameraParams.projection[0]; // gamma1 (fx)
+        rightCameraMatrix.at<double>(1, 1) = rightCameraParams.projection[1]; // gamma2 (fy)
+        rightCameraMatrix.at<double>(0, 2) = rightCameraParams.projection[2]; // u0 (cx)
+        rightCameraMatrix.at<double>(1, 2) = rightCameraParams.projection[3]; // v0 (cy)
+        
+        // For fisheye model, we need exactly 4 coefficients: k1, k2, k3, k4
+        // KITTI360 MEI provides k1, k2, p1, p2 - we'll use k1, k2 and set k3, k4 to 0
+        leftDistCoeffs = cv::Mat::zeros(4, 1, CV_64F);
+        leftDistCoeffs.at<double>(0) = leftCameraParams.distortion[0]; // k1
+        leftDistCoeffs.at<double>(1) = leftCameraParams.distortion[1]; // k2
+        leftDistCoeffs.at<double>(2) = 0.0; // k3
+        leftDistCoeffs.at<double>(3) = 0.0; // k4
+        
+        rightDistCoeffs = cv::Mat::zeros(4, 1, CV_64F);
+        rightDistCoeffs.at<double>(0) = rightCameraParams.distortion[0]; // k1
+        rightDistCoeffs.at<double>(1) = rightCameraParams.distortion[1]; // k2
+        rightDistCoeffs.at<double>(2) = 0.0; // k3
+        rightDistCoeffs.at<double>(3) = 0.0; // k4
+    }
+    
+    void createUndistortionMaps() {
+        cv::Size imageSize(leftCameraParams.image_width, leftCameraParams.image_height);
+        
+        std::cout << "Creating fisheye undistortion maps for image size: " << imageSize << std::endl;
+        
+        // Create new camera matrices with scaled focal lengths for wider FOV
+        cv::Mat newLeftCameraMatrix = leftCameraMatrix.clone();
+        cv::Mat newRightCameraMatrix = rightCameraMatrix.clone();
+        double scale = 0.2; // More aggressive scaling to capture more of the fisheye FOV
+        
+        newLeftCameraMatrix.at<double>(0, 0) *= scale; // fx
+        newLeftCameraMatrix.at<double>(1, 1) *= scale; // fy
+        newRightCameraMatrix.at<double>(0, 0) *= scale; // fx
+        newRightCameraMatrix.at<double>(1, 1) *= scale; // fy
+        
+        // Create undistortion maps for left camera using fisheye model
+        cv::fisheye::initUndistortRectifyMap(
+            leftCameraMatrix, leftDistCoeffs, cv::Mat(),
+            newLeftCameraMatrix, imageSize, CV_16SC2,
+            leftMapX, leftMapY
+        );
+        
+        // Create undistortion maps for right camera using fisheye model
+        cv::fisheye::initUndistortRectifyMap(
+            rightCameraMatrix, rightDistCoeffs, cv::Mat(),
+            newRightCameraMatrix, imageSize, CV_16SC2,
+            rightMapX, rightMapY
+        );
+        
+        std::cout << "Fisheye undistortion maps created successfully!" << std::endl;
+    }
+    
+    SDL_Surface* undistortImage(SDL_Surface* originalSurface, bool isLeftCamera) {
+        if (!calibrationLoaded || !originalSurface) {
+            return nullptr;
+        }
+        
+        // Convert SDL surface to OpenCV Mat
+        cv::Mat originalMat = sdlSurfaceToMat(originalSurface);
+        if (originalMat.empty()) {
+            return nullptr;
+        }
+        
+        // Apply undistortion
+        cv::Mat undistortedMat;
+        if (isLeftCamera) {
+            cv::remap(originalMat, undistortedMat, leftMapX, leftMapY, cv::INTER_LINEAR);
+        } else {
+            cv::remap(originalMat, undistortedMat, rightMapX, rightMapY, cv::INTER_LINEAR);
+        }
+        
+        // Convert back to SDL surface
+        return matToSdlSurface(undistortedMat);
+    }
+    
+    cv::Mat sdlSurfaceToMat(SDL_Surface* surface) {
+        if (!surface) return cv::Mat();
+        
+        // Convert SDL surface format if needed
+        SDL_Surface* rgbSurface = SDL_ConvertSurfaceFormat(surface, SDL_PIXELFORMAT_RGB24, 0);
+        if (!rgbSurface) {
+            std::cerr << "Failed to convert surface format: " << SDL_GetError() << std::endl;
+            return cv::Mat();
+        }
+        
+        // Create OpenCV Mat from surface data
+        cv::Mat mat(rgbSurface->h, rgbSurface->w, CV_8UC3, rgbSurface->pixels, rgbSurface->pitch);
+        
+        // OpenCV uses BGR, SDL uses RGB, so convert
+        cv::Mat bgrMat;
+        cv::cvtColor(mat, bgrMat, cv::COLOR_RGB2BGR);
+        
+        // Make a copy since we'll free the surface
+        cv::Mat result = bgrMat.clone();
+        
+        SDL_FreeSurface(rgbSurface);
+        return result;
+    }
+    
+    SDL_Surface* matToSdlSurface(const cv::Mat& mat) {
+        if (mat.empty()) return nullptr;
+        
+        // Convert BGR to RGB
+        cv::Mat rgbMat;
+        cv::cvtColor(mat, rgbMat, cv::COLOR_BGR2RGB);
+        
+        // Create SDL surface
+        SDL_Surface* surface = SDL_CreateRGBSurfaceFrom(
+            rgbMat.data, rgbMat.cols, rgbMat.rows, 24, rgbMat.step,
+            0x000000FF, 0x0000FF00, 0x00FF0000, 0
+        );
+        
+        if (!surface) {
+            std::cerr << "Failed to create SDL surface: " << SDL_GetError() << std::endl;
+            return nullptr;
+        }
+        
+        // Make a copy since the original data will go out of scope
+        SDL_Surface* copy = SDL_ConvertSurface(surface, surface->format, 0);
+        SDL_FreeSurface(surface);
+        
+        return copy;
     }
     
     bool loadStereoPairs(const std::string& leftDir, const std::string& rightDir) {
@@ -249,26 +422,45 @@ public:
             // Load right surface
             SDL_Surface* rightSurface = IMG_Load(stereoPairs[i]->rightFilename.c_str());
             
+            // Apply undistortion if calibration is loaded
+            SDL_Surface* undistortedLeftSurface = nullptr;
+            SDL_Surface* undistortedRightSurface = nullptr;
+            
+            if (calibrationLoaded) {
+                if (leftSurface) {
+                    undistortedLeftSurface = undistortImage(leftSurface, true); // true for left camera
+                    SDL_FreeSurface(leftSurface); // Free original distorted surface
+                }
+                if (rightSurface) {
+                    undistortedRightSurface = undistortImage(rightSurface, false); // false for right camera
+                    SDL_FreeSurface(rightSurface); // Free original distorted surface
+                }
+            } else {
+                // If no calibration, use original surfaces
+                undistortedLeftSurface = leftSurface;
+                undistortedRightSurface = rightSurface;
+            }
+            
             {
                 std::lock_guard<std::mutex> lock(imagesMutex);
                 
-                if (leftSurface) {
-                    stereoPairs[i]->leftSurface = leftSurface;
+                if (undistortedLeftSurface) {
+                    stereoPairs[i]->leftSurface = undistortedLeftSurface;
                     stereoPairs[i]->leftSurfaceLoaded = true;
                     
                     // Create texture immediately for initial pairs
-                    stereoPairs[i]->leftTexture = SDL_CreateTextureFromSurface(renderer, leftSurface);
+                    stereoPairs[i]->leftTexture = SDL_CreateTextureFromSurface(renderer, undistortedLeftSurface);
                     if (stereoPairs[i]->leftTexture) {
                         stereoPairs[i]->leftTextureCreated = true;
                     }
                 }
                 
-                if (rightSurface) {
-                    stereoPairs[i]->rightSurface = rightSurface;
+                if (undistortedRightSurface) {
+                    stereoPairs[i]->rightSurface = undistortedRightSurface;
                     stereoPairs[i]->rightSurfaceLoaded = true;
                     
                     // Create texture immediately for initial pairs
-                    stereoPairs[i]->rightTexture = SDL_CreateTextureFromSurface(renderer, rightSurface);
+                    stereoPairs[i]->rightTexture = SDL_CreateTextureFromSurface(renderer, undistortedRightSurface);
                     if (stereoPairs[i]->rightTexture) {
                         stereoPairs[i]->rightTextureCreated = true;
                     }
@@ -289,16 +481,35 @@ public:
         SDL_Surface* leftSurface = IMG_Load(stereoPairs[index]->leftFilename.c_str());
         SDL_Surface* rightSurface = IMG_Load(stereoPairs[index]->rightFilename.c_str());
         
+        // Apply undistortion if calibration is loaded
+        SDL_Surface* undistortedLeftSurface = nullptr;
+        SDL_Surface* undistortedRightSurface = nullptr;
+        
+        if (calibrationLoaded) {
+            if (leftSurface) {
+                undistortedLeftSurface = undistortImage(leftSurface, true); // true for left camera
+                SDL_FreeSurface(leftSurface); // Free original distorted surface
+            }
+            if (rightSurface) {
+                undistortedRightSurface = undistortImage(rightSurface, false); // false for right camera
+                SDL_FreeSurface(rightSurface); // Free original distorted surface
+            }
+        } else {
+            // If no calibration, use original surfaces
+            undistortedLeftSurface = leftSurface;
+            undistortedRightSurface = rightSurface;
+        }
+        
         {
             std::lock_guard<std::mutex> lock(imagesMutex);
             
-            if (leftSurface) {
-                stereoPairs[index]->leftSurface = leftSurface;
+            if (undistortedLeftSurface) {
+                stereoPairs[index]->leftSurface = undistortedLeftSurface;
                 stereoPairs[index]->leftSurfaceLoaded = true;
             }
             
-            if (rightSurface) {
-                stereoPairs[index]->rightSurface = rightSurface;
+            if (undistortedRightSurface) {
+                stereoPairs[index]->rightSurface = undistortedRightSurface;
                 stereoPairs[index]->rightSurfaceLoaded = true;
             }
         }
@@ -544,6 +755,11 @@ int main(int argc, char* argv[]) {
     if (!viewer.initialize()) {
         std::cerr << "Failed to initialize SDL" << std::endl;
         return 1;
+    }
+    
+    // Load fisheye calibration for undistortion
+    if (!viewer.loadCalibration()) {
+        std::cerr << "Warning: Failed to load calibration data. Images will be displayed without undistortion." << std::endl;
     }
     
     if (!viewer.loadStereoPairs(leftDirectory, rightDirectory)) {
