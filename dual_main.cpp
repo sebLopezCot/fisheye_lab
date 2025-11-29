@@ -69,6 +69,7 @@ private:
     cv::Mat rightCameraMatrix, rightDistCoeffs;
     cv::Mat leftMapX, leftMapY, rightMapX, rightMapY;
     cv::Size outputImageSize;  // Size for the unwrapped output images
+    cv::Size displayImageSize; // Size for screen-friendly display
     bool calibrationLoaded;
     
     // Background loading
@@ -81,7 +82,7 @@ private:
     
 public:
     StereoFisheyeViewer() : window(nullptr), renderer(nullptr), currentIndex(0), 
-                            windowWidth(2400), windowHeight(1200), running(true), 
+                            windowWidth(1800), windowHeight(900), running(true), 
                             calibrationLoaded(false), backgroundLoadingComplete(false), 
                             nextImageToLoad(0) {}
     
@@ -100,7 +101,7 @@ public:
             return false;
         }
         
-        window = SDL_CreateWindow("Dual Fisheye Unwrapped Viewer - Left & Right Cameras",
+        window = SDL_CreateWindow("Ultra-Flat Dual Fisheye Unwrapped Viewer (Screen-Scaled) - Left & Right",
                                   SDL_WINDOWPOS_CENTERED,
                                   SDL_WINDOWPOS_CENTERED,
                                   windowWidth, windowHeight,
@@ -203,9 +204,9 @@ public:
         cv::Size inputImageSize(leftCameraParams.image_width, leftCameraParams.image_height);
         
         // Create a much larger output size for the unwrapped fisheye
-        // Fisheye ~180° FOV needs to be spread across a wider format
-        outputImageSize.width = static_cast<int>(inputImageSize.width * 2.5);
-        outputImageSize.height = static_cast<int>(inputImageSize.height * 1.5);
+        // For ultra-flat projection, we need extreme width to spread angular changes linearly
+        outputImageSize.width = static_cast<int>(inputImageSize.width * 4.0);
+        outputImageSize.height = static_cast<int>(inputImageSize.height * 2.0);
         
         std::cout << "Creating dual fisheye undistortion maps:" << std::endl;
         std::cout << "  Input image size: " << inputImageSize << std::endl;
@@ -221,8 +222,8 @@ public:
         newRightCameraMatrix.at<double>(0, 2) = outputImageSize.width / 2.0;  // cx
         newRightCameraMatrix.at<double>(1, 2) = outputImageSize.height / 2.0; // cy
         
-        // Increase focal lengths for fisheye expansion
-        double expandScale = 2.5;
+        // For ultra-flat projection, use much more aggressive focal length scaling
+        double expandScale = 5.0;  // Much higher for flatter projection
         newLeftCameraMatrix.at<double>(0, 0) *= expandScale; // fx
         newLeftCameraMatrix.at<double>(1, 1) *= expandScale; // fy
         newRightCameraMatrix.at<double>(0, 0) *= expandScale; // fx
@@ -269,6 +270,17 @@ public:
         }
         
         std::cout << "✓ Dual fisheye undistortion maps created successfully!" << std::endl;
+        
+        // Calculate display size (scale down for screen-friendly viewing)
+        double targetMaxWidth = 800.0;  // Target width for each camera view (half of total window)
+        double scale = targetMaxWidth / outputImageSize.width;
+        if (scale > 1.0) scale = 1.0;  // Don't scale up
+        
+        displayImageSize.width = static_cast<int>(outputImageSize.width * scale);
+        displayImageSize.height = static_cast<int>(outputImageSize.height * scale);
+        
+        std::cout << "Display size (scaled): " << displayImageSize.width << "x" << displayImageSize.height 
+                  << " (scale=" << scale << ")" << std::endl;
     }
     
     SDL_Surface* undistortImage(SDL_Surface* originalSurface, bool isLeftCamera) {
@@ -283,14 +295,18 @@ public:
         }
         
         // Create output image with the larger size for unwrapped fisheye
-        cv::Mat undistortedMat(outputImageSize, originalMat.type(), cv::Scalar(0, 0, 0));
+        cv::Mat undistortedMatFull(outputImageSize, originalMat.type(), cv::Scalar(0, 0, 0));
         
         // Apply undistortion to larger output format
         if (isLeftCamera) {
-            cv::remap(originalMat, undistortedMat, leftMapX, leftMapY, cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+            cv::remap(originalMat, undistortedMatFull, leftMapX, leftMapY, cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
         } else {
-            cv::remap(originalMat, undistortedMat, rightMapX, rightMapY, cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+            cv::remap(originalMat, undistortedMatFull, rightMapX, rightMapY, cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
         }
+        
+        // Scale down to display size while preserving aspect ratio
+        cv::Mat undistortedMat;
+        cv::resize(undistortedMatFull, undistortedMat, displayImageSize, 0, 0, cv::INTER_AREA);
         
         // Convert back to SDL surface
         return matToSdlSurface(undistortedMat);

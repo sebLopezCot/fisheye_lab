@@ -15,10 +15,20 @@ private:
     cv::Mat cameraMatrix, distCoeffs;
     cv::Mat mapX, mapY;
     cv::Size outputImageSize;  // Size for the unwrapped output image
+    cv::Mat originalImage;     // Store original image for real-time processing
     bool calibrationLoaded;
     
+    // Interactive parameters
+    double currentFocalScale;
+    double currentWidthMultiplier;
+    double currentHeightMultiplier;
+    
+    // Interactive calibration parameters
+    cv::Mat adjustedCameraMatrix, adjustedDistCoeffs;
+    
 public:
-    FisheyeUndistorter() : calibrationLoaded(false) {}
+    FisheyeUndistorter() : calibrationLoaded(false), currentFocalScale(5.0), 
+                           currentWidthMultiplier(4.0), currentHeightMultiplier(2.0) {}
     
     bool loadCalibration() {
         try {
@@ -44,6 +54,10 @@ public:
             
             // Setup camera matrix and distortion coefficients
             setupCameraParameters();
+            
+            // Initialize adjustable parameters with loaded values
+            adjustedCameraMatrix = cameraMatrix.clone();
+            adjustedDistCoeffs = distCoeffs.clone();
             
             // Create undistortion maps
             createUndistortionMaps();
@@ -95,10 +109,10 @@ public:
         cv::Size inputImageSize(cameraParams.image_width, cameraParams.image_height);
         
         // Create a much larger output size for the unwrapped fisheye
-        // Fisheye ~180° FOV needs to be spread across a wider format
-        // Use approximately 2.5x width and 1.5x height for the panoramic unwrapped view
-        outputImageSize.width = static_cast<int>(inputImageSize.width * 2.5);
-        outputImageSize.height = static_cast<int>(inputImageSize.height * 1.5);
+        // For ultra-flat projection, we need extreme width to spread angular changes linearly
+        // Use approximately 4x width and 2x height for ultra-wide panoramic view
+        outputImageSize.width = static_cast<int>(inputImageSize.width * 4.0);
+        outputImageSize.height = static_cast<int>(inputImageSize.height * 2.0);
         
         std::cout << "Creating fisheye undistortion maps:" << std::endl;
         std::cout << "  Input image size: " << inputImageSize << std::endl;
@@ -117,27 +131,27 @@ public:
         newCameraMatrix1.at<double>(0, 2) = outputImageSize.width / 2.0;  // cx
         newCameraMatrix1.at<double>(1, 2) = outputImageSize.height / 2.0; // cy
         
-        // Increase focal lengths for fisheye expansion
-        double expandScale = 2.5;
+        // For ultra-flat projection, use much more aggressive focal length scaling
+        double expandScale = 5.0;  // Much higher for flatter projection
         newCameraMatrix1.at<double>(0, 0) *= expandScale; // fx
         newCameraMatrix1.at<double>(1, 1) *= expandScale; // fy
         
-        // Approach 2: More aggressive expansion with better principal point
+        // Approach 2: Even more aggressive expansion for ultra-flat result
         cv::Mat newCameraMatrix2 = cameraMatrix.clone();
         newCameraMatrix2.at<double>(0, 2) = outputImageSize.width / 2.0;  // cx
         newCameraMatrix2.at<double>(1, 2) = outputImageSize.height / 2.0; // cy
         
-        double aggressiveScale = 4.0;
-        newCameraMatrix2.at<double>(0, 0) *= aggressiveScale; // fx
-        newCameraMatrix2.at<double>(1, 1) *= aggressiveScale; // fy
+        double ultraFlatScale = 8.0;  // Ultra-aggressive scaling
+        newCameraMatrix2.at<double>(0, 0) *= ultraFlatScale; // fx
+        newCameraMatrix2.at<double>(1, 1) *= ultraFlatScale; // fy
         
         // Approach 3: Try inverting the distortion coefficients
         cv::Mat invertedDistCoeffs = -distCoeffs; // Invert the signs
         
-        std::cout << "Testing different approaches for fisheye-to-flat transformation:" << std::endl;
+        std::cout << "Testing different approaches for ultra-flat fisheye transformation:" << std::endl;
         std::cout << "Original camera matrix:" << std::endl << cameraMatrix << std::endl;
         std::cout << "Expanded camera matrix (scale=" << expandScale << "):" << std::endl << newCameraMatrix1 << std::endl;
-        std::cout << "Aggressive expansion (scale=" << aggressiveScale << "):" << std::endl << newCameraMatrix2 << std::endl;
+        std::cout << "Ultra-flat expansion (scale=" << ultraFlatScale << "):" << std::endl << newCameraMatrix2 << std::endl;
         std::cout << "Original distortion:" << distCoeffs.t() << std::endl;
         std::cout << "Inverted distortion:" << invertedDistCoeffs.t() << std::endl;
         
@@ -194,16 +208,86 @@ public:
         
         std::cout << "Applying undistortion to image:" << std::endl;
         std::cout << "  Input size: " << originalImage.cols << "x" << originalImage.rows << std::endl;
-        std::cout << "  Output size: " << outputImageSize.width << "x" << outputImageSize.height << std::endl;
+        std::cout << "  Full unwrapped size: " << outputImageSize.width << "x" << outputImageSize.height << std::endl;
         
         // Create output image with the larger size for unwrapped fisheye
-        cv::Mat undistortedImage(outputImageSize, originalImage.type(), cv::Scalar(0, 0, 0));
+        cv::Mat undistortedImageFull(outputImageSize, originalImage.type(), cv::Scalar(0, 0, 0));
         
         // Apply the undistortion mapping
-        cv::remap(originalImage, undistortedImage, mapX, mapY, cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+        cv::remap(originalImage, undistortedImageFull, mapX, mapY, cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
         
-        std::cout << "✓ Undistortion applied successfully to larger output format!" << std::endl;
+        // Scale down to a more screen-friendly size while preserving aspect ratio
+        cv::Mat undistortedImage = scaleForDisplay(undistortedImageFull);
+        
+        std::cout << "✓ Undistortion applied and scaled for display!" << std::endl;
         return undistortedImage;
+    }
+    
+    cv::Mat scaleForDisplay(const cv::Mat& fullSizeImage) {
+        // Calculate a reasonable display size (target max width ~1800px)
+        double targetMaxWidth = 1800.0;
+        double scale = targetMaxWidth / fullSizeImage.cols;
+        
+        // Make sure we don't scale up, only down
+        if (scale > 1.0) scale = 1.0;
+        
+        int displayWidth = static_cast<int>(fullSizeImage.cols * scale);
+        int displayHeight = static_cast<int>(fullSizeImage.rows * scale);
+        
+        cv::Mat scaledImage;
+        cv::resize(fullSizeImage, scaledImage, cv::Size(displayWidth, displayHeight), 0, 0, cv::INTER_AREA);
+        
+        std::cout << "  Scaled to display size: " << displayWidth << "x" << displayHeight 
+                  << " (scale=" << scale << ")" << std::endl;
+        
+        return scaledImage;
+    }
+    
+    void updateUndistortionMaps() {
+        cv::Size inputImageSize(cameraParams.image_width, cameraParams.image_height);
+        
+        // Create output size based on current multipliers
+        outputImageSize.width = static_cast<int>(inputImageSize.width * currentWidthMultiplier);
+        outputImageSize.height = static_cast<int>(inputImageSize.height * currentHeightMultiplier);
+        
+        // Create new camera matrix with current focal scale
+        cv::Mat newCameraMatrix = cameraMatrix.clone();
+        newCameraMatrix.at<double>(0, 2) = outputImageSize.width / 2.0;  // cx
+        newCameraMatrix.at<double>(1, 2) = outputImageSize.height / 2.0; // cy
+        newCameraMatrix.at<double>(0, 0) *= currentFocalScale; // fx
+        newCameraMatrix.at<double>(1, 1) *= currentFocalScale; // fy
+        
+        // Create undistortion maps with current parameters (using adjusted calibration)
+        try {
+            cv::fisheye::initUndistortRectifyMap(
+                adjustedCameraMatrix, adjustedDistCoeffs, cv::Mat(),
+                newCameraMatrix, outputImageSize, CV_16SC2,
+                mapX, mapY
+            );
+        } catch (const cv::Exception& e) {
+            std::cerr << "Fisheye undistortion failed, using standard undistortion..." << std::endl;
+            cv::initUndistortRectifyMap(
+                adjustedCameraMatrix, adjustedDistCoeffs, cv::Mat(),
+                newCameraMatrix, outputImageSize, CV_16SC2,
+                mapX, mapY
+            );
+        }
+    }
+    
+    cv::Mat processWithCurrentParams() {
+        if (!calibrationLoaded || originalImage.empty()) {
+            return cv::Mat();
+        }
+        
+        // Update undistortion maps with current parameters
+        updateUndistortionMaps();
+        
+        // Apply undistortion
+        cv::Mat undistortedImageFull(outputImageSize, originalImage.type(), cv::Scalar(0, 0, 0));
+        cv::remap(originalImage, undistortedImageFull, mapX, mapY, cv::INTER_LINEAR, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+        
+        // Scale for display
+        return scaleForDisplay(undistortedImageFull);
     }
     
     void processAndDisplay(const std::string& imagePath) {
@@ -214,8 +298,8 @@ public:
         
         std::cout << "\n=== LOADING AND PROCESSING IMAGE ===" << std::endl;
         
-        // Load original image
-        cv::Mat originalImage = cv::imread(imagePath, cv::IMREAD_COLOR);
+        // Load and store original image
+        originalImage = cv::imread(imagePath, cv::IMREAD_COLOR);
         if (originalImage.empty()) {
             std::cerr << "✗ Failed to load image: " << imagePath << std::endl;
             return;
@@ -230,107 +314,191 @@ public:
                       << "x" << cameraParams.image_height << ")" << std::endl;
         }
         
-        // Apply undistortion
-        cv::Mat undistortedImage = undistortImage(originalImage);
-        if (undistortedImage.empty()) {
-            std::cerr << "✗ Failed to undistort image" << std::endl;
-            return;
-        }
-        
-        std::cout << "\n=== DISPLAYING RESULTS ===" << std::endl;
-        std::cout << "✓ Displaying original and undistorted images in separate windows" << std::endl;
-        std::cout << "Controls:" << std::endl;
-        std::cout << "  - Press '1' to focus on original fisheye image" << std::endl;
-        std::cout << "  - Press '2' to focus on unwrapped image (extra wide view)" << std::endl;
-        std::cout << "  - Press 'c' to show stacked comparison" << std::endl;
-        std::cout << "  - Press ESC or 'q' to quit" << std::endl;
+        std::cout << "\n=== INTERACTIVE FISHEYE CALIBRATION TUNING ===" << std::endl;
+        std::cout << "Use trackbars to adjust calibration parameters in real-time:" << std::endl;
+        std::cout << "  PROJECTION CONTROLS:" << std::endl;
+        std::cout << "    - Focal Scale: How much to expand the fisheye (higher = flatter)" << std::endl;
+        std::cout << "    - Width/Height: Output image dimensions" << std::endl;
+        std::cout << "  CALIBRATION TUNING:" << std::endl;
+        std::cout << "    - k1, k2: Radial distortion coefficients" << std::endl;
+        std::cout << "    - k3, k4: Additional fisheye distortion" << std::endl;
+        std::cout << "    - fx, fy: Camera focal lengths" << std::endl;
+        std::cout << "Press ESC to quit" << std::endl;
         
         // Create windows
         cv::namedWindow("Original Fisheye", cv::WINDOW_NORMAL);
-        cv::namedWindow("Undistorted (Unwrapped)", cv::WINDOW_NORMAL);
+        cv::namedWindow("Interactive Undistorted", cv::WINDOW_NORMAL);
+        cv::namedWindow("Projection Controls", cv::WINDOW_NORMAL);
+        cv::namedWindow("Calibration Tuning", cv::WINDOW_NORMAL);
         
-        // Add labels to images
+        // Create placeholder images for control windows
+        cv::Mat projControlsImage = cv::Mat::zeros(180, 600, CV_8UC3);
+        cv::putText(projControlsImage, "PROJECTION CONTROLS", cv::Point(150, 30), 
+                    cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(0, 255, 255), 2);
+        cv::putText(projControlsImage, "Adjust output format and expansion:", cv::Point(50, 60), 
+                    cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(200, 200, 200), 1);
+        cv::imshow("Projection Controls", projControlsImage);
+        
+        cv::Mat calibControlsImage = cv::Mat::zeros(280, 600, CV_8UC3);
+        cv::putText(calibControlsImage, "CALIBRATION TUNING", cv::Point(150, 30), 
+                    cv::FONT_HERSHEY_SIMPLEX, 0.8, cv::Scalar(255, 0, 255), 2);
+        cv::putText(calibControlsImage, "Fine-tune fisheye distortion model:", cv::Point(50, 60), 
+                    cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(200, 200, 200), 1);
+        cv::putText(calibControlsImage, "k1,k2: Main radial distortion", cv::Point(50, 90), 
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(150, 150, 150), 1);
+        cv::putText(calibControlsImage, "k3,k4: Additional fisheye correction", cv::Point(50, 110), 
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(150, 150, 150), 1);
+        cv::putText(calibControlsImage, "fx,fy: Focal length scaling", cv::Point(50, 130), 
+                    cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(150, 150, 150), 1);
+        cv::imshow("Calibration Tuning", calibControlsImage);
+        
+        // Position windows
+        cv::moveWindow("Original Fisheye", 50, 50);
+        cv::moveWindow("Interactive Undistorted", 600, 50);
+        cv::moveWindow("Projection Controls", 50, 650);
+        cv::moveWindow("Calibration Tuning", 700, 650);
+        
+        // Resize windows
+        cv::resizeWindow("Original Fisheye", 500, 500);
+        cv::resizeWindow("Interactive Undistorted", 1000, 500);
+        cv::resizeWindow("Projection Controls", 600, 220);
+        cv::resizeWindow("Calibration Tuning", 600, 320);
+        
+        // Create projection control trackbars
+        int focalScale = static_cast<int>(currentFocalScale * 10);
+        int widthMult = static_cast<int>(currentWidthMultiplier * 10);
+        int heightMult = static_cast<int>(currentHeightMultiplier * 10);
+        
+        cv::createTrackbar("Focal Scale x10", "Projection Controls", &focalScale, 150, 
+                          [](int val, void* userdata) {
+                              auto* self = static_cast<FisheyeUndistorter*>(userdata);
+                              self->currentFocalScale = val / 10.0;
+                              self->updateDisplay();
+                          }, this);
+        
+        cv::createTrackbar("Width Mult x10", "Projection Controls", &widthMult, 100, 
+                          [](int val, void* userdata) {
+                              auto* self = static_cast<FisheyeUndistorter*>(userdata);
+                              self->currentWidthMultiplier = std::max(1.0, val / 10.0);
+                              self->updateDisplay();
+                          }, this);
+        
+        cv::createTrackbar("Height Mult x10", "Projection Controls", &heightMult, 50, 
+                          [](int val, void* userdata) {
+                              auto* self = static_cast<FisheyeUndistorter*>(userdata);
+                              self->currentHeightMultiplier = std::max(1.0, val / 10.0);
+                              self->updateDisplay();
+                          }, this);
+        
+        // Create calibration tuning trackbars
+        // For distortion coefficients, use offset to allow negative values
+        int k1_offset = static_cast<int>((adjustedDistCoeffs.at<double>(0) + 2.0) * 1000); // Range: -2.0 to 2.0
+        int k2_offset = static_cast<int>((adjustedDistCoeffs.at<double>(1) + 5.0) * 100);  // Range: -5.0 to 5.0
+        int k3_offset = static_cast<int>((adjustedDistCoeffs.at<double>(2) + 0.01) * 10000); // Range: -0.01 to 0.01
+        int k4_offset = static_cast<int>((adjustedDistCoeffs.at<double>(3) + 0.01) * 10000); // Range: -0.01 to 0.01
+        
+        cv::createTrackbar("k1 x1000+2000", "Calibration Tuning", &k1_offset, 4000, 
+                          [](int val, void* userdata) {
+                              auto* self = static_cast<FisheyeUndistorter*>(userdata);
+                              self->adjustedDistCoeffs.at<double>(0) = (val / 1000.0) - 2.0;
+                              self->updateDisplay();
+                          }, this);
+        
+        cv::createTrackbar("k2 x100+500", "Calibration Tuning", &k2_offset, 1000, 
+                          [](int val, void* userdata) {
+                              auto* self = static_cast<FisheyeUndistorter*>(userdata);
+                              self->adjustedDistCoeffs.at<double>(1) = (val / 100.0) - 5.0;
+                              self->updateDisplay();
+                          }, this);
+        
+        cv::createTrackbar("k3 x10000+100", "Calibration Tuning", &k3_offset, 200, 
+                          [](int val, void* userdata) {
+                              auto* self = static_cast<FisheyeUndistorter*>(userdata);
+                              self->adjustedDistCoeffs.at<double>(2) = (val / 10000.0) - 0.01;
+                              self->updateDisplay();
+                          }, this);
+        
+        cv::createTrackbar("k4 x10000+100", "Calibration Tuning", &k4_offset, 200, 
+                          [](int val, void* userdata) {
+                              auto* self = static_cast<FisheyeUndistorter*>(userdata);
+                              self->adjustedDistCoeffs.at<double>(3) = (val / 10000.0) - 0.01;
+                              self->updateDisplay();
+                          }, this);
+        
+        // Camera focal length adjustments (as percentages of original)
+        int fx_percent = 100; // 100% = original value
+        int fy_percent = 100;
+        
+        cv::createTrackbar("fx percent", "Calibration Tuning", &fx_percent, 200, 
+                          [](int val, void* userdata) {
+                              auto* self = static_cast<FisheyeUndistorter*>(userdata);
+                              self->adjustedCameraMatrix.at<double>(0, 0) = self->cameraMatrix.at<double>(0, 0) * (val / 100.0);
+                              self->updateDisplay();
+                          }, this);
+        
+        cv::createTrackbar("fy percent", "Calibration Tuning", &fy_percent, 200, 
+                          [](int val, void* userdata) {
+                              auto* self = static_cast<FisheyeUndistorter*>(userdata);
+                              self->adjustedCameraMatrix.at<double>(1, 1) = self->cameraMatrix.at<double>(1, 1) * (val / 100.0);
+                              self->updateDisplay();
+                          }, this);
+        
+        // Display original image
         cv::Mat labeledOriginal = originalImage.clone();
-        cv::Mat labeledUndistorted = undistortedImage.clone();
-        
         cv::putText(labeledOriginal, "ORIGINAL FISHEYE", cv::Point(30, 40), 
                     cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 255), 2);
-        cv::putText(labeledUndistorted, "UNDISTORTED (UNWRAPPED)", cv::Point(30, 40), 
-                    cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
-        
-        // Position windows side by side
-        cv::moveWindow("Original Fisheye", 100, 100);
-        cv::moveWindow("Undistorted (Unwrapped)", 800, 100);
-        
-        // Make the undistorted window larger to accommodate the wider format
-        cv::resizeWindow("Original Fisheye", 600, 600);
-        cv::resizeWindow("Undistorted (Unwrapped)", 1600, 800);  // Much wider for the unwrapped format
-        
-        // Display both images
         cv::imshow("Original Fisheye", labeledOriginal);
-        cv::imshow("Undistorted (Unwrapped)", labeledUndistorted);
         
-        // Create comparison view - since images are different sizes, stack vertically
-        cv::Mat comparison;
-        cv::Mat resizedOriginal, resizedUndistorted;
+        // Initial undistortion
+        updateDisplay();
         
-        // Resize both to have the same width for vertical stacking
-        int comparisonWidth = std::max(originalImage.cols, undistortedImage.cols);
-        cv::resize(originalImage, resizedOriginal, cv::Size(comparisonWidth, 
-                  originalImage.rows * comparisonWidth / originalImage.cols));
-        cv::resize(undistortedImage, resizedUndistorted, cv::Size(comparisonWidth, 
-                  undistortedImage.rows * comparisonWidth / undistortedImage.cols));
-        
-        cv::vconcat(resizedOriginal, resizedUndistorted, comparison);
-        
-        cv::putText(comparison, "ORIGINAL FISHEYE", cv::Point(30, 40), 
-                    cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 255), 2);
-        cv::putText(comparison, "UNDISTORTED (UNWRAPPED)", cv::Point(30, resizedOriginal.rows + 40), 
-                    cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
-        
-        // Draw horizontal line to separate the images
-        cv::line(comparison, cv::Point(0, resizedOriginal.rows), 
-                 cv::Point(comparison.cols, resizedOriginal.rows), cv::Scalar(255, 255, 255), 3);
-        
-        // Interactive loop
+        // Wait for user input
         while (true) {
-            int key = cv::waitKey(0);
-            
-            if (key == 27 || key == 'q' || key == 'Q') { // ESC or 'q'
+            int key = cv::waitKey(30);
+            if (key == 27) { // ESC
                 break;
-            } else if (key == '1') {
-                // Focus on original image - make it larger
-                cv::destroyWindow("Undistorted (Unwrapped)");
-                cv::destroyWindow("Comparison");
-                cv::namedWindow("Original Fisheye - LARGE", cv::WINDOW_NORMAL);
-                cv::resizeWindow("Original Fisheye - LARGE", 1000, 1000);
-                cv::imshow("Original Fisheye - LARGE", labeledOriginal);
-                std::cout << "Focused on original fisheye image. Press '2' for undistorted or 'c' for comparison." << std::endl;
-            } else if (key == '2') {
-                // Focus on undistorted image - make it even larger and wider for the unwrapped format
-                cv::destroyWindow("Original Fisheye");
-                cv::destroyWindow("Original Fisheye - LARGE");
-                cv::destroyWindow("Comparison");
-                cv::namedWindow("Undistorted - LARGE", cv::WINDOW_NORMAL);
-                cv::resizeWindow("Undistorted - LARGE", 1800, 800);  // Much wider for unwrapped format
-                cv::imshow("Undistorted - LARGE", labeledUndistorted);
-                std::cout << "Focused on unwrapped fisheye (extra wide view). Press '1' for original or 'c' for comparison." << std::endl;
-            } else if (key == 'c' || key == 'C') {
-                // Show stacked comparison (original top, unwrapped bottom)
-                cv::destroyWindow("Original Fisheye");
-                cv::destroyWindow("Original Fisheye - LARGE");
-                cv::destroyWindow("Undistorted - LARGE");
-                cv::destroyWindow("Undistorted (Unwrapped)");
-                cv::namedWindow("Comparison", cv::WINDOW_NORMAL);
-                cv::resizeWindow("Comparison", 1200, 1000);  // Taller for vertical stacking
-                cv::imshow("Comparison", comparison);
-                std::cout << "Showing stacked comparison (original top, unwrapped bottom). Press '1' or '2' for individual views." << std::endl;
             }
         }
         
         cv::destroyAllWindows();
-        
-        std::cout << "✓ Done!" << std::endl;
+        std::cout << "✓ Done! Final parameters:" << std::endl;
+        std::cout << "  Projection: Focal=" << currentFocalScale 
+                  << ", Width=" << currentWidthMultiplier 
+                  << ", Height=" << currentHeightMultiplier << std::endl;
+        std::cout << "  Calibration:" << std::endl;
+        std::cout << "    Distortion: k1=" << adjustedDistCoeffs.at<double>(0) 
+                  << ", k2=" << adjustedDistCoeffs.at<double>(1)
+                  << ", k3=" << adjustedDistCoeffs.at<double>(2)
+                  << ", k4=" << adjustedDistCoeffs.at<double>(3) << std::endl;
+        std::cout << "    Focal lengths: fx=" << adjustedCameraMatrix.at<double>(0, 0)
+                  << ", fy=" << adjustedCameraMatrix.at<double>(1, 1) << std::endl;
+    }
+    
+    void updateDisplay() {
+        cv::Mat undistorted = processWithCurrentParams();
+        if (!undistorted.empty()) {
+            // Add parameter info to the image
+            cv::Mat labeledUndistorted = undistorted.clone();
+            
+            std::string projText = "Proj: F=" + std::to_string(currentFocalScale).substr(0,4) + 
+                                 " W=" + std::to_string(currentWidthMultiplier).substr(0,4) + 
+                                 " H=" + std::to_string(currentHeightMultiplier).substr(0,4);
+            std::string calibText = "Calib: k1=" + std::to_string(adjustedDistCoeffs.at<double>(0)).substr(0,6) +
+                                  " k2=" + std::to_string(adjustedDistCoeffs.at<double>(1)).substr(0,6);
+            std::string calibText2 = "k3=" + std::to_string(adjustedDistCoeffs.at<double>(2)).substr(0,7) +
+                                   " k4=" + std::to_string(adjustedDistCoeffs.at<double>(3)).substr(0,7);
+            
+            cv::putText(labeledUndistorted, "INTERACTIVE CALIBRATION TUNING", cv::Point(30, 40), 
+                        cv::FONT_HERSHEY_SIMPLEX, 1.0, cv::Scalar(0, 255, 0), 2);
+            cv::putText(labeledUndistorted, projText, cv::Point(30, 80), 
+                        cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 255), 2);
+            cv::putText(labeledUndistorted, calibText, cv::Point(30, 110), 
+                        cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 0, 255), 2);
+            cv::putText(labeledUndistorted, calibText2, cv::Point(30, 140), 
+                        cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 0, 255), 2);
+            
+            cv::imshow("Interactive Undistorted", labeledUndistorted);
+        }
     }
 };
 
